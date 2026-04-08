@@ -285,8 +285,15 @@ def main() -> int:
         shutdown_event.wait(2.0)
 
     log.info("mimir stopped")
-    return 0
+    # Use os._exit instead of returning normally so Python skips
+    # module-level cleanup. libtorch / ctranslate2 / faster-whisper have
+    # a long C++ destructor chain that segfaults / std::terminates if
+    # called from the interpreter shutdown path, which would otherwise
+    # leave the systemd unit in a "failed (core-dump)" state every time
+    # we restart cleanly. systemd-journal is line-buffered so the
+    # "mimir stopped" log line above is already flushed.
+    os._exit(0)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

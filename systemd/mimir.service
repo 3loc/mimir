@@ -3,7 +3,15 @@ Description=mimir transcribe daemon
 Documentation=https://github.com/3loc/mimir
 After=network-online.target heimdall@meeting.service
 Wants=network-online.target
-Requires=heimdall@meeting.service
+
+# PartOf (not Requires) so when heimdall@meeting is restarted — e.g. via
+# `make deploy` from the heimdall repo — mimir is automatically restarted
+# along with it. PartOf propagates stop AND restart; Requires only
+# propagates stop, which would leave mimir in a "failed" state any time
+# heimdall was redeployed. Mimir's reader thread already retries the
+# Unix-socket connection with backoff, so a strict hard dependency on
+# heimdall isn't needed.
+PartOf=heimdall@meeting.service
 
 [Service]
 Type=simple
