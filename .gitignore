@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.python-version
+
+# Downloaded models live in ~/.cache/huggingface and ~/.cache/torch by
+# default, NOT in this directory — but keep these out anyway in case
+# we ever change that.
+models/
+*.bin
+*.pt
+*.safetensors
+
+.env
+*.log

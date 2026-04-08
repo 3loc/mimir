@@ -1,0 +1,36 @@
+[Unit]
+Description=mimir transcribe daemon
+Documentation=https://github.com/3loc/mimir
+After=network-online.target heimdall@meeting.service
+Wants=network-online.target
+Requires=heimdall@meeting.service
+
+[Service]
+Type=simple
+User=ted
+Group=ted
+
+WorkingDirectory=/home/ted/src/github.com/3loc/loki/repos/mimir
+EnvironmentFile=/etc/mimir/mimir.env
+
+# uv-managed venv lives at .venv/ inside the project. We invoke the venv's
+# Python directly rather than going through `uv run` to avoid uv re-checking
+# locks on every restart.
+ExecStart=/home/ted/src/github.com/3loc/loki/repos/mimir/.venv/bin/python src/mimir.py
+
+Restart=on-failure
+RestartSec=5
+
+# Model loading takes a while; allow up to 5 minutes to start.
+TimeoutStartSec=300
+# And up to 10 seconds to stop cleanly.
+TimeoutStopSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+# Mild sandboxing
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

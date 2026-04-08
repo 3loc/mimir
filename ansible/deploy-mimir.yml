@@ -1,0 +1,113 @@
+---
+# Deploys mimir (transcribe daemon) to the local Minisforum (agneta).
+#
+# Idempotent. First run is slow because it downloads ~2 GB of model files
+# and torch wheels. Subsequent runs are fast.
+- name: Deploy mimir (transcribe daemon)
+  hosts: agneta
+  become: true
+
+  vars:
+    mimir_user: ted
+    mimir_dir: /home/ted/src/github.com/3loc/loki/repos/mimir
+    mimir_venv: /home/ted/src/github.com/3loc/loki/repos/mimir/.venv
+
+  tasks:
+    # --- System packages ---
+    - name: Install system packages required by mimir
+      pacman:
+        name:
+          - ansible        # self-managed
+          - uv             # Python project + venv manager
+          - git
+          - ffmpeg         # whisperx uses it for audio loading (we don't, but the dep chain might)
+        state: present
+        update_cache: true
+
+    # --- Project venv ---
+    # Run uv as ted so the venv is owned by ted (systemd runs mimir as ted).
+    - name: Create uv venv with Python 3.12
+      command: uv venv --python 3.12 --managed-python {{ mimir_venv }}
+      args:
+        chdir: "{{ mimir_dir }}"
+        creates: "{{ mimir_venv }}/bin/python"
+      become_user: "{{ mimir_user }}"
+
+    - name: Sync project dependencies (whisperx + CPU torch)
+      command: uv sync
+      args:
+        chdir: "{{ mimir_dir }}"
+      become_user: "{{ mimir_user }}"
+      register: uv_sync
+      changed_when: "'Resolved' in (uv_sync.stderr | default('')) or 'Installed' in (uv_sync.stderr | default(''))"
+      # First run can take several minutes; bump the timeout.
+      async: 1800
+      poll: 30
+
+    # --- Pre-warm the WhisperX model + alignment model ---
+    # This downloads ~1–2 GB to ~/.cache/huggingface/hub on first run.
+    # Idempotent: re-running with cached models is a fast no-op.
+    - name: Pre-fetch WhisperX models
+      command: "{{ mimir_venv }}/bin/python scripts/prefetch-models.py"
+      args:
+        chdir: "{{ mimir_dir }}"
+      become_user: "{{ mimir_user }}"
+      environment:
+        MIMIR_MODEL: "{{ lookup('env', 'MIMIR_MODEL') | default('distil-large-v3', true) }}"
+        MIMIR_LANGUAGE: en
+        MIMIR_COMPUTE_TYPE: int8
+      register: prefetch
+      changed_when: "'done' in (prefetch.stdout | default(''))"
+      async: 1800
+      poll: 30
+
+    # --- Install systemd unit + env file ---
+    - name: Ensure /etc/mimir config directory exists
+      file:
+        path: /etc/mimir
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install mimir.env
+      copy:
+        src: ../systemd/mimir.env
+        dest: /etc/mimir/mimir.env
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart mimir
+
+    - name: Install mimir.service
+      copy:
+        src: ../systemd/mimir.service
+        dest: /etc/systemd/system/mimir.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart mimir
+
+    - name: Force any pending reloads / restarts before enabling
+      meta: flush_handlers
+
+    - name: Enable and start mimir.service
+      systemd:
+        name: mimir.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: restart mimir
+      systemd:
+        name: mimir.service
+        state: restarted
+        daemon_reload: true
+      failed_when: false

@@ -1,0 +1,33 @@
+[project]
+name = "mimir"
+version = "0.0.1"
+description = "Transcribe daemon for loki — heimdall audio → WhisperX → text on TCP"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # 3.8.4+ — earlier 3.8.x are yanked. Newer WhisperX requires numpy>=2.1
+    # so do NOT pin numpy<2 here.
+    "whisperx>=3.8.4",
+    # All three torch packages MUST come from the same index (pytorch-cpu)
+    # or torchvision's C extensions can't register operators against torch
+    # and you get a confusing `Could not import module 'Pipeline'` error
+    # from transformers' conditional imports.
+    "torch>=2.0",
+    "torchaudio>=2.0",
+    "torchvision>=0.15",
+]
+
+[tool.uv]
+managed = true
+
+# Force the CPU build of torch / torchaudio. Without this, uv on Linux
+# pulls the CUDA wheels (~2 GB), which we cannot use on agneta and would
+# fail to load anyway. The pytorch-cpu index has CPU-only wheels.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchaudio = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]

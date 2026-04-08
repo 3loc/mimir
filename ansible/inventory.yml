@@ -1,0 +1,10 @@
+---
+# mimir is deployed to the same host it runs on (agneta, the Minisforum)
+# via ansible_connection: local — no SSH.
+all:
+  hosts:
+    agneta:
+      ansible_host: localhost
+      ansible_connection: local
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
