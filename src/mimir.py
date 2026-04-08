@@ -164,10 +164,21 @@ def worker_thread(model) -> None:
 
         segments = result.get("segments", []) if isinstance(result, dict) else []
         nonempty = [s for s in segments if (s.get("text") or "").strip()]
-        log.info(
-            "transcribe: %ds window in %.2fs (rtf=%.2fx) → %d segment(s)",
-            WINDOW_SECONDS, dt, rtf, len(nonempty),
-        )
+        # Only log INFO for windows that produced actual transcription.
+        # Silent windows are the common case during quiet stretches and
+        # would otherwise spam the journal at one INFO line per 5
+        # seconds. They drop to DEBUG so debugging the worker is still
+        # possible if you crank journald to debug level.
+        if nonempty:
+            log.info(
+                "transcribe: %ds window in %.2fs (rtf=%.2fx) → %d segment(s)",
+                WINDOW_SECONDS, dt, rtf, len(nonempty),
+            )
+        else:
+            log.debug(
+                "transcribe: %ds window in %.2fs (rtf=%.2fx) → silent",
+                WINDOW_SECONDS, dt, rtf,
+            )
 
         # Emit raw segment text — no timestamp prefix. The transcript is
         # meant to flow as continuous prose; downstream consumers (odin,
@@ -273,6 +284,13 @@ def shutdown(signum, frame) -> None:
 def main() -> int:
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
+
+    # Silence WhisperX's per-window WARNING when the audio contains no
+    # speech ("whisperx.vads.silero - WARNING - No active speech found
+    # in audio"). It fires every 5 seconds during meeting silence and
+    # generates ~1500 garbage log lines per hour of quiet. Real silero
+    # errors (ERROR / CRITICAL) still propagate.
+    logging.getLogger("whisperx.vads.silero").setLevel(logging.ERROR)
 
     log.info(
         "mimir starting: model=%s lang=%s window=%ds heimdall=%s tcp=%s:%d",
