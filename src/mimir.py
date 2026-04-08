@@ -169,12 +169,15 @@ def worker_thread(model) -> None:
             WINDOW_SECONDS, dt, rtf, len(nonempty),
         )
 
-        ts = datetime.now().strftime("%H:%M:%S")
+        # Emit raw segment text — no timestamp prefix. The transcript is
+        # meant to flow as continuous prose; downstream consumers (odin,
+        # nc, anything else) join lines and present them to humans
+        # without per-window timestamps. The journal still gets stamped
+        # by systemd-journald, so debugging timing isn't lost.
         for seg in nonempty:
             text = (seg.get("text") or "").strip()
-            line = f"[{ts}] {text}"
-            print(line, flush=True)
-            _broadcast(line + "\n")
+            print(text, flush=True)
+            _broadcast(text + "\n")
 
     log.info("worker: exiting")
 
@@ -182,15 +185,35 @@ def worker_thread(model) -> None:
 # ─── TCP fanout server ───────────────────────────────────────────────────────
 
 def _broadcast(text: str) -> None:
-    """Send a text line (already newline-terminated) to all subscribers."""
+    """Send a text line (already newline-terminated) to all subscribers.
+
+    Subscribers are non-blocking sockets (set in tcp_accept_thread on
+    accept). A healthy peer drains the kernel send buffer fast enough
+    that send() returns the full byte count. A dead peer stuck in
+    CLOSE-WAIT (e.g. ``nc`` Ctrl-C'd) eventually fills its send
+    buffer; send() then raises BlockingIOError, at which point we
+    drop it. This is the fix for the bug where six dead nc clients
+    in CLOSE-WAIT froze the entire transcribe pipeline because
+    sendall() was blocking forever on a dead socket while holding
+    the broadcast lock.
+    """
     data = text.encode("utf-8")
     dead: list[socket.socket] = []
     with tcp_subscribers_lock:
         for sub in tcp_subscribers:
             try:
-                sub.sendall(data)
+                sent = sub.send(data)
+            except BlockingIOError:
+                log.warning("tcp: subscriber too slow (kernel buffer full), dropping")
+                dead.append(sub)
+                continue
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 log.info("tcp: subscriber dead (%s)", e)
+                dead.append(sub)
+                continue
+            if sent < len(data):
+                log.warning("tcp: subscriber partial write (%d/%d), dropping",
+                            sent, len(data))
                 dead.append(sub)
         for sub in dead:
             tcp_subscribers.remove(sub)
@@ -217,14 +240,18 @@ def tcp_accept_thread() -> None:
                 continue
             except OSError:
                 break
-            # Send a welcome banner so the client knows it's connected.
+            # Non-blocking sends are critical: a CLOSE-WAIT'd peer (e.g.
+            # an nc client the user Ctrl-C'd) would otherwise block
+            # sendall() forever once its kernel send buffer fills, and
+            # freeze the transcribe pipeline. Same fix as heimdall.
+            conn.setblocking(False)
+            # Welcome banner — best-effort, ignore failures.
             try:
-                conn.sendall(
+                conn.send(
                     f"# mimir transcribe stream — model={MODEL_NAME} window={WINDOW_SECONDS}s\n".encode()
                 )
-            except OSError:
-                conn.close()
-                continue
+            except (BlockingIOError, OSError):
+                pass
             with tcp_subscribers_lock:
                 tcp_subscribers.append(conn)
             log.info("tcp: subscriber from %s:%d connected (%d total)",
