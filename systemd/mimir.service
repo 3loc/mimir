@@ -20,6 +20,11 @@ Group=ted
 
 WorkingDirectory=/home/ted/src/github.com/3loc/loki/repos/mimir
 EnvironmentFile=/etc/mimir/mimir.env
+# Optional second env file for the HuggingFace token used by pyannote
+# diarization. The leading `-` makes it optional, so the unit doesn't
+# fail if you haven't created it yet. See
+# https://github.com/3loc/mimir for the setup walkthrough.
+EnvironmentFile=-/etc/mimir/hf-token.env
 
 # uv-managed venv lives at .venv/ inside the project. We invoke the venv's
 # Python directly rather than going through `uv run` to avoid uv re-checking

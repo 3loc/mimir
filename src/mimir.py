@@ -55,6 +55,20 @@ TCP_PORT = int(os.environ.get("MIMIR_TCP_PORT", "7200"))
 # a HuggingFace token. Silero is open and works fine for meeting audio.
 VAD_METHOD = os.environ.get("MIMIR_VAD_METHOD", "silero")
 
+# Speaker diarization via pyannote. Off by default — set MIMIR_DIARIZE=1
+# to turn it on, and provide HF_TOKEN via /etc/mimir/hf-token.env.
+# Caveat: speaker labels (SPEAKER_00, SPEAKER_01, …) are LOCAL to each
+# call. SPEAKER_00 in one window is not necessarily the same physical
+# person as SPEAKER_00 in the next window — pyannote doesn't maintain
+# identity across separate diarize() calls. For real cross-window
+# identity you'd need to either accumulate longer audio chunks before
+# diarizing, or use a second mic source tagged at the device level.
+DIARIZE_ENABLED = os.environ.get("MIMIR_DIARIZE", "0") == "1"
+DIARIZE_MODEL = os.environ.get(
+    "MIMIR_DIARIZE_MODEL", "pyannote/speaker-diarization-community-1"
+)
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
 SAMPLE_RATE = 16000  # heimdall produces 16 kHz mono s16le
 WINDOW_BYTES = SAMPLE_RATE * WINDOW_SECONDS * 2  # 2 bytes per sample
 MAX_BUFFER_BYTES = SAMPLE_RATE * 60 * 2  # cap at 60 s of audio
@@ -136,8 +150,35 @@ def reader_thread() -> None:
 
 # ─── worker (buffer → WhisperX → emit) ───────────────────────────────────────
 
-def worker_thread(model) -> None:
-    """Pull WINDOW_BYTES at a time, transcribe, emit segments."""
+def _assign_speaker(seg: dict, diarize_segments) -> str | None:
+    """Pick the speaker label whose time range overlaps the segment most.
+
+    `diarize_segments` is whatever pyannote's DiarizationPipeline returned
+    via WhisperX — currently a pandas.DataFrame with columns 'start',
+    'end', 'speaker'. We iterate, find the diarization row whose
+    [start, end] overlaps the transcript segment's [start, end] the most,
+    and return its 'speaker' value. None if no overlap.
+    """
+    s_start = float(seg.get("start") or 0.0)
+    s_end = float(seg.get("end") or s_start)
+    best_overlap = 0.0
+    best_speaker: str | None = None
+    try:
+        for _, row in diarize_segments.iterrows():
+            d_start = float(row.get("start", 0.0))
+            d_end = float(row.get("end", 0.0))
+            overlap = max(0.0, min(s_end, d_end) - max(s_start, d_start))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = str(row.get("speaker") or "")
+    except Exception:
+        # Pandas API differences / unexpected shape — fall back gracefully.
+        return None
+    return best_speaker or None
+
+
+def worker_thread(model, diarize_pipeline) -> None:
+    """Pull WINDOW_BYTES at a time, transcribe, optionally diarize, emit."""
     import numpy as np
 
     while not shutdown_event.is_set():
@@ -180,6 +221,16 @@ def worker_thread(model) -> None:
                 WINDOW_SECONDS, dt, rtf,
             )
 
+        # Optional: run pyannote diarization on the same audio window so
+        # each segment can be tagged with a speaker label.
+        diarize_segments = None
+        if diarize_pipeline is not None and nonempty:
+            try:
+                diarize_segments = diarize_pipeline(audio)
+            except Exception:
+                log.exception("diarize: failed on %ds window", WINDOW_SECONDS)
+                diarize_segments = None
+
         # Emit raw segment text — no timestamp prefix. The transcript is
         # meant to flow as continuous prose; downstream consumers (odin,
         # nc, anything else) join lines and present them to humans
@@ -187,8 +238,15 @@ def worker_thread(model) -> None:
         # by systemd-journald, so debugging timing isn't lost.
         for seg in nonempty:
             text = (seg.get("text") or "").strip()
-            print(text, flush=True)
-            _broadcast(text + "\n")
+            speaker: str | None = None
+            if diarize_segments is not None:
+                speaker = _assign_speaker(seg, diarize_segments)
+            if speaker:
+                line = f"[{speaker}] {text}"
+            else:
+                line = text
+            print(line, flush=True)
+            _broadcast(line + "\n")
 
     log.info("worker: exiting")
 
@@ -311,9 +369,40 @@ def main() -> int:
     )
     log.info("loaded whisperx in %.1fs", time.monotonic() - t0)
 
+    diarize_pipeline = None
+    if DIARIZE_ENABLED:
+        if not HF_TOKEN:
+            log.error(
+                "diarization: MIMIR_DIARIZE=1 but HF_TOKEN is not set in the "
+                "environment (expected via /etc/mimir/hf-token.env). "
+                "Continuing WITHOUT diarization."
+            )
+        else:
+            log.info("loading pyannote diarization model %s ...", DIARIZE_MODEL)
+            t1 = time.monotonic()
+            try:
+                from whisperx.diarize import DiarizationPipeline  # noqa: E402
+                diarize_pipeline = DiarizationPipeline(
+                    model_name=DIARIZE_MODEL,
+                    use_auth_token=HF_TOKEN,
+                    device="cpu",
+                )
+                log.info("loaded diarization in %.1fs", time.monotonic() - t1)
+            except Exception:
+                log.exception(
+                    "diarization: failed to load pipeline. Continuing WITHOUT "
+                    "diarization. Check that you accepted the EULA at "
+                    "https://huggingface.co/%s and that HF_TOKEN is valid.",
+                    DIARIZE_MODEL,
+                )
+                diarize_pipeline = None
+
     threads = [
         threading.Thread(target=reader_thread, name="audio-reader", daemon=True),
-        threading.Thread(target=worker_thread, args=(model,), name="worker", daemon=True),
+        threading.Thread(
+            target=worker_thread, args=(model, diarize_pipeline),
+            name="worker", daemon=True,
+        ),
         threading.Thread(target=tcp_accept_thread, name="tcp-accept", daemon=True),
     ]
     for t in threads:
