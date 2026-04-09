@@ -26,6 +26,14 @@ RuntimeDirectoryPreserve=yes
 
 WorkingDirectory=/home/ted/src/github.com/3loc/loki/repos/mimir
 EnvironmentFile=-/etc/mimir/mimir-diart.env
+# The sidecar needs HF_TOKEN to fetch pyannote's gated segmentation /
+# embedding models on first run (they're cached after that, but the
+# huggingface_hub build_hf_headers path still checks for a token even
+# for local-cache reads, so this isn't optional once diart is loaded).
+# The leading `-` keeps startup working if the file doesn't exist yet,
+# but once pyannote needs a token it will fail loud with
+# LocalTokenNotFoundError. Put a single HF_TOKEN=... line in this file.
+EnvironmentFile=-/etc/mimir/hf-token.env
 
 # The sidecar runs in its OWN venv at .venv-diart/, separate from
 # mimir's main .venv/. diart's dep stack (torch 2.2.2, torchaudio
