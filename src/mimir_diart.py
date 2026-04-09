@@ -84,11 +84,22 @@ LABEL = os.environ.get("MIMIR_DIART_LABEL", "MEETING")
 
 # ─── logging ─────────────────────────────────────────────────────────────────
 
+# NOTE on force=True: pyannote.audio and pytorch-lightning both configure
+# handlers on the root logger during import. By the time this module's
+# top-level code runs, the root logger already has handlers attached, so
+# a plain logging.basicConfig() call becomes a no-op and all our log.info()
+# calls disappear into the void. force=True tells basicConfig to nuke any
+# existing handlers and set up a fresh one, which makes the sidecar's own
+# log lines actually reach stderr (and from there systemd-journald).
+# Without this, you get a silent sidecar that looks alive but has no
+# observable state and is impossible to debug when something goes wrong.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    force=True,
 )
 log = logging.getLogger("mimir-diart")
+log.setLevel(logging.INFO)
 
 
 # ─── shared state ────────────────────────────────────────────────────────────
