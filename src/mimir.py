@@ -414,6 +414,22 @@ def diart_reader_thread(label: str, socket_path: str) -> None:
     log.info("%s: reader exiting", prefix)
 
 
+def _format_speaker_label(diart_speaker: str) -> str:
+    """Convert diart's internal 'speakerN' string into a clean display tag.
+
+    Diart emits speaker labels like 'speaker0', 'speaker1', 'speaker2'
+    — all lower-case, no separator. Downstream consumers (odin →
+    zerokb → Claude Code) are much easier to read when each speaker
+    is tagged 'SPEAKER-0', 'SPEAKER-1' etc, matching the shape of a
+    typical interview transcript. Anything that doesn't fit the
+    'speaker<digits>' pattern is uppercased as-is, so custom diart
+    configs or future label schemes still round-trip sensibly.
+    """
+    if diart_speaker.startswith("speaker") and diart_speaker[7:].isdigit():
+        return f"SPEAKER-{diart_speaker[7:]}"
+    return diart_speaker.upper()
+
+
 def _find_speaker_for_segment(
     label: str,
     seg_wall_start: float,
@@ -543,28 +559,38 @@ def worker_thread(model) -> None:
                 label, WINDOW_SECONDS, dt, rtf,
             )
 
-        # Emit each segment. If this source is diarized (listed in
-        # MIMIR_DIARIZE_SOURCES) and a diart speaker event overlaps
-        # the segment, tag it with `[LABEL-SPKn]`. Otherwise fall back
-        # to plain `[LABEL]`. The wall-clock range for each segment is
+        # Emit each segment. For diarized sources (listed in
+        # MIMIR_DIARIZE_SOURCES), tag with `[SPEAKER-N]` where N is
+        # the diart speaker index, or `[SPEAKER-?]` when diart hasn't
+        # caught up to this window yet (diart's streaming pipeline
+        # has roughly 20s of emit latency on the current agneta CPU,
+        # so the first few segments after a source starts are
+        # unavoidably unknown). For non-diarized sources, tag with
+        # `[LABEL]` (e.g. `[TED]` — the label IS the speaker, by
+        # hardware, because the source is a close-talking single-
+        # speaker mic). The wall-clock range for each segment is
         # computed from the window's start wall plus the segment's
-        # intra-window offset (seg.start / seg.end are seconds relative
-        # to the window, which is in turn anchored at window_start_wall).
+        # intra-window offset (seg.start / seg.end are seconds
+        # relative to the window, which is anchored at
+        # window_start_wall).
         for seg in nonempty:
             text = (seg.get("text") or "").strip()
-            speaker: str | None = None
+            tag: str
             if label in DIARIZE_SOURCES:
                 seg_rel_start = float(seg.get("start") or 0.0)
                 seg_rel_end = float(seg.get("end") or seg_rel_start)
                 seg_wall_start = window_start_wall + seg_rel_start
                 seg_wall_end = window_start_wall + seg_rel_end
-                speaker = _find_speaker_for_segment(
+                diart_speaker = _find_speaker_for_segment(
                     label, seg_wall_start, seg_wall_end
                 )
-            if speaker:
-                line = f"[{label}-{speaker.upper()}] {text}"
+                if diart_speaker:
+                    tag = _format_speaker_label(diart_speaker)
+                else:
+                    tag = "SPEAKER-?"
             else:
-                line = f"[{label}] {text}"
+                tag = label
+            line = f"[{tag}] {text}"
             print(line, flush=True)
             _broadcast(line + "\n")
 
