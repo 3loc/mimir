@@ -1,32 +1,48 @@
 #!/usr/bin/env python3
 """mimir — transcribe daemon for loki.
 
-Subscribes to a heimdall audio Unix socket, runs WhisperX on rolling
-windows, and emits one transcript line per non-empty segment to all
-clients connected to a TCP fanout server.
+Subscribes to one or more heimdall audio Unix sockets, runs WhisperX on
+rolling windows per source, and emits each transcript segment tagged
+with its source label (e.g. `[MEETING]`, `[TED]`) to all clients
+connected to a TCP fanout server.
 
 Configuration via environment variables (set by systemd EnvironmentFile):
 
-    MIMIR_HEIMDALL_SOCKET   Unix socket to subscribe to
-                            (default /run/heimdall/meeting.sock)
+    MIMIR_SOURCES           comma-separated LABEL=PATH pairs of heimdall
+                            sockets to subscribe to. Example:
+                              MEETING=/run/heimdall/meeting.sock,TED=/run/heimdall/ted.sock
+                            (default: the two entries above)
     MIMIR_MODEL             WhisperX model name (default distil-large-v3)
     MIMIR_LANGUAGE          ISO 639-1 language code (default en)
     MIMIR_COMPUTE_TYPE      ctranslate2 compute type (default int8)
     MIMIR_BATCH_SIZE        WhisperX batch size (default 16)
     MIMIR_WINDOW_SECONDS    audio window per inference (default 20)
+    MIMIR_VAD_METHOD        whisperx VAD method (default silero)
     MIMIR_TCP_HOST          fanout TCP bind host (default 0.0.0.0)
     MIMIR_TCP_PORT          fanout TCP bind port (default 7200)
 
-Architecture: three threads.
+Architecture: N+2 threads.
 
-  reader_thread       blocks on heimdall recv, appends to a bytearray
-                      buffer under a lock; trims to bound memory.
-  worker_thread       extracts WINDOW_SECONDS of audio at a time, runs
-                      WhisperX, emits each segment as a line.
-  tcp_accept_thread   accepts TCP clients, adds to a subscriber list.
+  reader_thread(label)   one per source. Blocks on heimdall recv,
+                         appends to that source's bytearray buffer under
+                         a shared condition variable; trims to bound
+                         memory; notifies the worker when new bytes
+                         arrive.
+  worker_thread          single worker. Iterates sources in rotating
+                         order, picks whichever has a full window ready,
+                         extracts WINDOW_SECONDS of audio, runs
+                         WhisperX, emits each segment as a line prefixed
+                         with `[LABEL]`.
+  tcp_accept_thread      accepts TCP clients, adds to a subscriber list.
 
 Emit() fans out the line to all subscribers under the same lock pattern
 as heimdall's audio fanout. Slow subscribers are dropped.
+
+Speaker diarization (diart on the `[MEETING]` source) is planned as a
+follow-up commit — see docs/decisions/0008-mimir-source-tagging-and-diart.md
+in the loki repo. This module previously ran pyannote-per-window diarization
+that was silently broken in production and gave labels with no cross-window
+identity; it has been removed.
 """
 
 from __future__ import annotations
@@ -43,7 +59,44 @@ from datetime import datetime
 
 # ─── config ──────────────────────────────────────────────────────────────────
 
-HEIMDALL_SOCKET = os.environ.get("MIMIR_HEIMDALL_SOCKET", "/run/heimdall/meeting.sock")
+def _parse_sources(env_value: str) -> dict[str, str]:
+    """Parse MIMIR_SOURCES as LABEL=PATH[,LABEL=PATH...].
+
+    Preserves insertion order (Python 3.7+ dict ordering) so the
+    worker's rotation order is deterministic from the env string.
+    Raises ValueError on malformed input rather than silently
+    dropping entries — we'd rather crash loud at startup than
+    quietly ignore a misconfigured source.
+    """
+    result: dict[str, str] = {}
+    for pair in env_value.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(f"MIMIR_SOURCES entry missing '=': {pair!r}")
+        label, path = pair.split("=", 1)
+        label = label.strip()
+        path = path.strip()
+        if not label or not path:
+            raise ValueError(f"MIMIR_SOURCES entry has empty label or path: {pair!r}")
+        if label in result:
+            raise ValueError(f"MIMIR_SOURCES has duplicate label {label!r}")
+        result[label] = path
+    if not result:
+        raise ValueError("MIMIR_SOURCES is empty — at least one LABEL=PATH required")
+    return result
+
+
+# Two-source default — MEETING (Elgato HDMI via heimdall@meeting) and
+# TED (close-talking lavalier via heimdall@ted). Override in the systemd
+# EnvironmentFile if you need a different shape (e.g. just MEETING for
+# headless-agneta mode, or adding a third source for in-person room mic).
+SOURCES = _parse_sources(os.environ.get(
+    "MIMIR_SOURCES",
+    "MEETING=/run/heimdall/meeting.sock,TED=/run/heimdall/ted.sock",
+))
+
 MODEL_NAME = os.environ.get("MIMIR_MODEL", "distil-large-v3")
 LANGUAGE = os.environ.get("MIMIR_LANGUAGE", "en")
 COMPUTE_TYPE = os.environ.get("MIMIR_COMPUTE_TYPE", "int8")
@@ -55,23 +108,9 @@ TCP_PORT = int(os.environ.get("MIMIR_TCP_PORT", "7200"))
 # a HuggingFace token. Silero is open and works fine for meeting audio.
 VAD_METHOD = os.environ.get("MIMIR_VAD_METHOD", "silero")
 
-# Speaker diarization via pyannote. Off by default — set MIMIR_DIARIZE=1
-# to turn it on, and provide HF_TOKEN via /etc/mimir/hf-token.env.
-# Caveat: speaker labels (SPEAKER_00, SPEAKER_01, …) are LOCAL to each
-# call. SPEAKER_00 in one window is not necessarily the same physical
-# person as SPEAKER_00 in the next window — pyannote doesn't maintain
-# identity across separate diarize() calls. For real cross-window
-# identity you'd need to either accumulate longer audio chunks before
-# diarizing, or use a second mic source tagged at the device level.
-DIARIZE_ENABLED = os.environ.get("MIMIR_DIARIZE", "0") == "1"
-DIARIZE_MODEL = os.environ.get(
-    "MIMIR_DIARIZE_MODEL", "pyannote/speaker-diarization-community-1"
-)
-HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-
 SAMPLE_RATE = 16000  # heimdall produces 16 kHz mono s16le
 WINDOW_BYTES = SAMPLE_RATE * WINDOW_SECONDS * 2  # 2 bytes per sample
-MAX_BUFFER_BYTES = SAMPLE_RATE * 60 * 2  # cap at 60 s of audio
+MAX_BUFFER_BYTES = SAMPLE_RATE * 60 * 2  # cap each source at 60 s of audio
 
 
 # ─── logging ─────────────────────────────────────────────────────────────────
@@ -87,7 +126,10 @@ log = logging.getLogger("mimir")
 
 shutdown_event = threading.Event()
 
-audio_buffer = bytearray()
+# One bytearray per source, keyed by label. All buffers share a single
+# condition variable so the worker can sleep on "any source has new
+# bytes" without a per-source cond var / busy-poll loop.
+audio_buffers: dict[str, bytearray] = {label: bytearray() for label in SOURCES}
 audio_buffer_lock = threading.Lock()
 audio_buffer_cond = threading.Condition(audio_buffer_lock)
 
@@ -95,45 +137,52 @@ tcp_subscribers: list[socket.socket] = []
 tcp_subscribers_lock = threading.Lock()
 
 
-# ─── audio reader (heimdall → buffer) ────────────────────────────────────────
+# ─── audio reader (heimdall → per-source buffer) ─────────────────────────────
 
-def reader_thread() -> None:
-    """Connect to heimdall and append PCM bytes to the shared buffer.
+def reader_thread(label: str, socket_path: str) -> None:
+    """Connect to one heimdall source and append PCM bytes to audio_buffers[label].
 
     Reconnects on socket loss with exponential backoff up to 5 s. Trims
-    the buffer from the front when it exceeds MAX_BUFFER_BYTES, keeping
-    the most recent audio (drops oldest, on the assumption that stale
-    audio is less interesting than fresh).
+    the per-source buffer from the front when it exceeds MAX_BUFFER_BYTES,
+    keeping the most recent audio (drops oldest, on the assumption that
+    stale audio is less interesting than fresh). Each source has its
+    own reader thread and its own buffer, but all readers share the
+    global audio_buffer_cond so the worker thread can wake on any
+    source's progress.
     """
     backoff = 0.5
+    prefix = f"audio[{label}]"
     while not shutdown_event.is_set():
         try:
-            log.info("audio: connecting to %s", HEIMDALL_SOCKET)
+            log.info("%s: connecting to %s", prefix, socket_path)
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(HEIMDALL_SOCKET)
+            sock.connect(socket_path)
         except (FileNotFoundError, ConnectionRefusedError) as e:
-            log.warning("audio: heimdall not ready (%s); retrying in %.1fs", e, backoff)
+            log.warning("%s: heimdall not ready (%s); retrying in %.1fs",
+                        prefix, e, backoff)
             shutdown_event.wait(backoff)
             backoff = min(backoff * 2, 5.0)
             continue
 
-        log.info("audio: connected")
+        log.info("%s: connected", prefix)
         backoff = 0.5
         try:
             while not shutdown_event.is_set():
                 chunk = sock.recv(8192)
                 if not chunk:
-                    log.warning("audio: heimdall closed the connection")
+                    log.warning("%s: heimdall closed the connection", prefix)
                     break
                 with audio_buffer_cond:
-                    audio_buffer.extend(chunk)
-                    if len(audio_buffer) > MAX_BUFFER_BYTES:
-                        drop = len(audio_buffer) - MAX_BUFFER_BYTES
-                        del audio_buffer[:drop]
-                        log.warning("audio: trimmed %d stale bytes (worker too slow?)", drop)
+                    buf = audio_buffers[label]
+                    buf.extend(chunk)
+                    if len(buf) > MAX_BUFFER_BYTES:
+                        drop = len(buf) - MAX_BUFFER_BYTES
+                        del buf[:drop]
+                        log.warning("%s: trimmed %d stale bytes (worker too slow?)",
+                                    prefix, drop)
                     audio_buffer_cond.notify_all()
         except OSError as e:
-            log.error("audio: read error: %s", e)
+            log.error("%s: read error: %s", prefix, e)
         finally:
             try:
                 sock.close()
@@ -141,55 +190,60 @@ def reader_thread() -> None:
                 pass
 
         if not shutdown_event.is_set():
-            log.info("audio: reconnecting in %.1fs", backoff)
+            log.info("%s: reconnecting in %.1fs", prefix, backoff)
             shutdown_event.wait(backoff)
             backoff = min(backoff * 2, 5.0)
 
-    log.info("audio: reader exiting")
+    log.info("%s: reader exiting", prefix)
 
 
-# ─── worker (buffer → WhisperX → emit) ───────────────────────────────────────
+# ─── worker (per-source buffers → WhisperX → emit) ───────────────────────────
 
-def _assign_speaker(seg: dict, diarize_segments) -> str | None:
-    """Pick the speaker label whose time range overlaps the segment most.
-
-    `diarize_segments` is whatever pyannote's DiarizationPipeline returned
-    via WhisperX — currently a pandas.DataFrame with columns 'start',
-    'end', 'speaker'. We iterate, find the diarization row whose
-    [start, end] overlaps the transcript segment's [start, end] the most,
-    and return its 'speaker' value. None if no overlap.
+def _pick_ready_source(rotation_start: int) -> str | None:
+    """Return the label of the first source (starting at rotation_start,
+    wrapping) with at least WINDOW_BYTES of audio buffered. None if no
+    source is ready. Caller must hold audio_buffer_lock.
     """
-    s_start = float(seg.get("start") or 0.0)
-    s_end = float(seg.get("end") or s_start)
-    best_overlap = 0.0
-    best_speaker: str | None = None
-    try:
-        for _, row in diarize_segments.iterrows():
-            d_start = float(row.get("start", 0.0))
-            d_end = float(row.get("end", 0.0))
-            overlap = max(0.0, min(s_end, d_end) - max(s_start, d_start))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = str(row.get("speaker") or "")
-    except Exception:
-        # Pandas API differences / unexpected shape — fall back gracefully.
-        return None
-    return best_speaker or None
+    labels = list(audio_buffers.keys())
+    n = len(labels)
+    for offset in range(n):
+        label = labels[(rotation_start + offset) % n]
+        if len(audio_buffers[label]) >= WINDOW_BYTES:
+            return label
+    return None
 
 
-def worker_thread(model, diarize_pipeline) -> None:
-    """Pull WINDOW_BYTES at a time, transcribe, optionally diarize, emit."""
+def worker_thread(model) -> None:
+    """Pull WINDOW_BYTES from whichever source is ready, transcribe, emit.
+
+    Sources are served in rotating order so no source can be starved
+    by a consistently-louder neighbor. When multiple sources are
+    simultaneously ready, the rotation index advances past the one we
+    just served, giving the other source(s) first crack next round.
+    """
     import numpy as np
 
+    labels = list(audio_buffers.keys())
+    label_index = {label: i for i, label in enumerate(labels)}
+    rotation_start = 0
+
     while not shutdown_event.is_set():
-        # Wait until enough audio is available.
+        # Wait until at least one source has a full window.
         with audio_buffer_cond:
-            while len(audio_buffer) < WINDOW_BYTES and not shutdown_event.is_set():
+            ready = _pick_ready_source(rotation_start)
+            while ready is None and not shutdown_event.is_set():
                 audio_buffer_cond.wait(timeout=1.0)
+                ready = _pick_ready_source(rotation_start)
             if shutdown_event.is_set():
                 break
-            window_bytes = bytes(audio_buffer[:WINDOW_BYTES])
-            del audio_buffer[:WINDOW_BYTES]
+            # Extract the window from the ready source's buffer.
+            window_bytes = bytes(audio_buffers[ready][:WINDOW_BYTES])
+            del audio_buffers[ready][:WINDOW_BYTES]
+            # Advance rotation so the other sources get first crack next
+            # iteration. (label_index[ready] + 1) wraps naturally via %.
+            rotation_start = (label_index[ready] + 1) % len(labels)
+
+        label = ready  # for clarity in logs + output below
 
         # Convert int16 → float32 in [-1, 1] (whisperx wants float32 mono).
         audio = np.frombuffer(window_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -198,7 +252,7 @@ def worker_thread(model, diarize_pipeline) -> None:
         try:
             result = model.transcribe(audio, batch_size=BATCH_SIZE, language=LANGUAGE)
         except Exception:
-            log.exception("transcribe: failed on %ds window", WINDOW_SECONDS)
+            log.exception("transcribe[%s]: failed on %ds window", label, WINDOW_SECONDS)
             continue
         dt = time.monotonic() - t0
         rtf = dt / WINDOW_SECONDS
@@ -212,39 +266,24 @@ def worker_thread(model, diarize_pipeline) -> None:
         # possible if you crank journald to debug level.
         if nonempty:
             log.info(
-                "transcribe: %ds window in %.2fs (rtf=%.2fx) → %d segment(s)",
-                WINDOW_SECONDS, dt, rtf, len(nonempty),
+                "transcribe[%s]: %ds window in %.2fs (rtf=%.2fx) → %d segment(s)",
+                label, WINDOW_SECONDS, dt, rtf, len(nonempty),
             )
         else:
             log.debug(
-                "transcribe: %ds window in %.2fs (rtf=%.2fx) → silent",
-                WINDOW_SECONDS, dt, rtf,
+                "transcribe[%s]: %ds window in %.2fs (rtf=%.2fx) → silent",
+                label, WINDOW_SECONDS, dt, rtf,
             )
 
-        # Optional: run pyannote diarization on the same audio window so
-        # each segment can be tagged with a speaker label.
-        diarize_segments = None
-        if diarize_pipeline is not None and nonempty:
-            try:
-                diarize_segments = diarize_pipeline(audio)
-            except Exception:
-                log.exception("diarize: failed on %ds window", WINDOW_SECONDS)
-                diarize_segments = None
-
-        # Emit raw segment text — no timestamp prefix. The transcript is
-        # meant to flow as continuous prose; downstream consumers (odin,
-        # nc, anything else) join lines and present them to humans
-        # without per-window timestamps. The journal still gets stamped
-        # by systemd-journald, so debugging timing isn't lost.
+        # Emit raw segment text prefixed with the source label. The
+        # transcript is meant to flow as continuous prose; downstream
+        # consumers (odin, nc, the host's Claude Code via loki-meeting)
+        # use the `[LABEL]` prefix as the *only* speaker attribution —
+        # there is no per-window timestamp. The journal still gets
+        # stamped by systemd-journald, so debugging timing isn't lost.
         for seg in nonempty:
             text = (seg.get("text") or "").strip()
-            speaker: str | None = None
-            if diarize_segments is not None:
-                speaker = _assign_speaker(seg, diarize_segments)
-            if speaker:
-                line = f"[{speaker}] {text}"
-            else:
-                line = text
+            line = f"[{label}] {text}"
             print(line, flush=True)
             _broadcast(line + "\n")
 
@@ -316,8 +355,10 @@ def tcp_accept_thread() -> None:
             conn.setblocking(False)
             # Welcome banner — best-effort, ignore failures.
             try:
+                sources_desc = ",".join(SOURCES.keys())
                 conn.send(
-                    f"# mimir transcribe stream — model={MODEL_NAME} window={WINDOW_SECONDS}s\n".encode()
+                    f"# mimir transcribe stream — model={MODEL_NAME} "
+                    f"window={WINDOW_SECONDS}s sources=[{sources_desc}]\n".encode()
                 )
             except (BlockingIOError, OSError):
                 pass
@@ -350,9 +391,10 @@ def main() -> int:
     # errors (ERROR / CRITICAL) still propagate.
     logging.getLogger("whisperx.vads.silero").setLevel(logging.ERROR)
 
+    sources_desc = ", ".join(f"{label}={path}" for label, path in SOURCES.items())
     log.info(
-        "mimir starting: model=%s lang=%s window=%ds heimdall=%s tcp=%s:%d",
-        MODEL_NAME, LANGUAGE, WINDOW_SECONDS, HEIMDALL_SOCKET, TCP_HOST, TCP_PORT,
+        "mimir starting: model=%s lang=%s window=%ds sources=[%s] tcp=%s:%d",
+        MODEL_NAME, LANGUAGE, WINDOW_SECONDS, sources_desc, TCP_HOST, TCP_PORT,
     )
 
     log.info(
@@ -369,42 +411,23 @@ def main() -> int:
     )
     log.info("loaded whisperx in %.1fs", time.monotonic() - t0)
 
-    diarize_pipeline = None
-    if DIARIZE_ENABLED:
-        if not HF_TOKEN:
-            log.error(
-                "diarization: MIMIR_DIARIZE=1 but HF_TOKEN is not set in the "
-                "environment (expected via /etc/mimir/hf-token.env). "
-                "Continuing WITHOUT diarization."
-            )
-        else:
-            log.info("loading pyannote diarization model %s ...", DIARIZE_MODEL)
-            t1 = time.monotonic()
-            try:
-                from whisperx.diarize import DiarizationPipeline  # noqa: E402
-                diarize_pipeline = DiarizationPipeline(
-                    model_name=DIARIZE_MODEL,
-                    use_auth_token=HF_TOKEN,
-                    device="cpu",
-                )
-                log.info("loaded diarization in %.1fs", time.monotonic() - t1)
-            except Exception:
-                log.exception(
-                    "diarization: failed to load pipeline. Continuing WITHOUT "
-                    "diarization. Check that you accepted the EULA at "
-                    "https://huggingface.co/%s and that HF_TOKEN is valid.",
-                    DIARIZE_MODEL,
-                )
-                diarize_pipeline = None
-
-    threads = [
-        threading.Thread(target=reader_thread, name="audio-reader", daemon=True),
-        threading.Thread(
-            target=worker_thread, args=(model, diarize_pipeline),
-            name="worker", daemon=True,
-        ),
-        threading.Thread(target=tcp_accept_thread, name="tcp-accept", daemon=True),
-    ]
+    # One reader thread per source, plus one worker and one TCP accept.
+    threads: list[threading.Thread] = []
+    for label, socket_path in SOURCES.items():
+        threads.append(threading.Thread(
+            target=reader_thread,
+            args=(label, socket_path),
+            name=f"audio-reader[{label}]",
+            daemon=True,
+        ))
+    threads.append(threading.Thread(
+        target=worker_thread, args=(model,),
+        name="worker", daemon=True,
+    ))
+    threads.append(threading.Thread(
+        target=tcp_accept_thread,
+        name="tcp-accept", daemon=True,
+    ))
     for t in threads:
         t.start()
 
