@@ -12,6 +12,16 @@ Configuration via environment variables (set by systemd EnvironmentFile):
                             sockets to subscribe to. Example:
                               MEETING=/run/heimdall/meeting.sock,TED=/run/heimdall/ted.sock
                             (default: the two entries above)
+    MIMIR_DIARIZE_SOURCES   comma-separated LABEL=SOCKET pairs of mimir-diart
+                            sidecar event sockets. Each labeled source
+                            gets its [LABEL] transcript lines tagged
+                            with [LABEL-SPKn] sub-speaker labels from
+                            diart. Example:
+                              MEETING=/run/mimir/diart-meeting.sock
+                            Default: empty (no diarization). If diart
+                            events are unavailable for a segment, mimir
+                            falls back to the plain [LABEL] prefix
+                            (fail-open, not fail-closed).
     MIMIR_MODEL             WhisperX model name (default distil-large-v3)
     MIMIR_LANGUAGE          ISO 639-1 language code (default en)
     MIMIR_COMPUTE_TYPE      ctranslate2 compute type (default int8)
@@ -21,32 +31,55 @@ Configuration via environment variables (set by systemd EnvironmentFile):
     MIMIR_TCP_HOST          fanout TCP bind host (default 0.0.0.0)
     MIMIR_TCP_PORT          fanout TCP bind port (default 7200)
 
-Architecture: N+2 threads.
+Architecture: N+M+2 threads.
 
-  reader_thread(label)   one per source. Blocks on heimdall recv,
-                         appends to that source's bytearray buffer under
-                         a shared condition variable; trims to bound
-                         memory; notifies the worker when new bytes
-                         arrive.
-  worker_thread          single worker. Iterates sources in rotating
-                         order, picks whichever has a full window ready,
-                         extracts WINDOW_SECONDS of audio, runs
-                         WhisperX, emits each segment as a line prefixed
-                         with `[LABEL]`.
-  tcp_accept_thread      accepts TCP clients, adds to a subscriber list.
+  reader_thread(label)       one per heimdall source. Blocks on heimdall
+                             recv, appends to that source's bytearray
+                             buffer under a shared condition variable;
+                             trims to bound memory; notifies the worker
+                             when new bytes arrive. Tracks `head_wall_time`
+                             per source — the wall-clock time of the byte
+                             currently at the buffer head — so the worker
+                             can correlate extracted windows with diart
+                             speaker events that use wall-clock anchors.
+
+  diart_reader_thread(label) one per MIMIR_DIARIZE_SOURCES entry.
+                             Subscribes to a mimir-diart sidecar's Unix
+                             socket, reads newline-delimited JSON events
+                             ({"event": "start", "audio_start_wall": ...}
+                             and {"event": "track", "audio_start": ...,
+                             "audio_end": ..., "speaker": "speaker0"}),
+                             and appends them to a per-source rolling
+                             event list under diart_events_lock.
+
+  worker_thread              single worker. Iterates sources in rotating
+                             order, picks whichever has a full window
+                             ready, extracts WINDOW_SECONDS of audio,
+                             runs WhisperX, and for each segment queries
+                             the diart event list for the source (if
+                             any) to find the overlapping speaker. Emits
+                             `[LABEL-SPKn] text` if a speaker is found,
+                             `[LABEL] text` otherwise (fail-open).
+
+  tcp_accept_thread          accepts TCP clients, adds to a subscriber list.
 
 Emit() fans out the line to all subscribers under the same lock pattern
 as heimdall's audio fanout. Slow subscribers are dropped.
 
-Speaker diarization (diart on the `[MEETING]` source) is planned as a
-follow-up commit — see docs/decisions/0008-mimir-source-tagging-and-diart.md
-in the loki repo. This module previously ran pyannote-per-window diarization
-that was silently broken in production and gave labels with no cross-window
-identity; it has been removed.
+Speaker diarization lives in a separate mimir-diart sidecar process
+with its own venv (diart's pinned deps are incompatible with whisperx).
+Failure isolation: if diart is down, mimir keeps transcribing without
+speaker labels. See docs/decisions/0008-mimir-source-tagging-and-diart.md
+in the loki repo for the rationale, and mimir_diart.py for the sidecar.
+
+This module previously ran in-process pyannote-per-window diarization
+that was silently broken in production and gave labels with no
+cross-window identity; that code has been removed entirely.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -97,6 +130,27 @@ SOURCES = _parse_sources(os.environ.get(
     "MEETING=/run/heimdall/meeting.sock,TED=/run/heimdall/ted.sock",
 ))
 
+# Optional mimir-diart sidecar event sockets. Empty by default — the
+# sidecar is opt-in and must be deployed separately (see
+# systemd/mimir-diart.service and src/mimir_diart.py). When set, each
+# labeled source's [LABEL] transcript lines get tagged with
+# [LABEL-SPKn] sub-speaker labels whenever a diart event overlaps the
+# segment. If the sidecar is down, mimir emits plain [LABEL] and keeps
+# going — fail-open.
+DIARIZE_SOURCES: dict[str, str] = {}
+_diarize_env = os.environ.get("MIMIR_DIARIZE_SOURCES", "").strip()
+if _diarize_env:
+    DIARIZE_SOURCES = _parse_sources(_diarize_env)
+    # Every diarize label must correspond to an existing source label;
+    # otherwise we'd be correlating speaker events against a stream we
+    # don't even transcribe.
+    unknown = set(DIARIZE_SOURCES) - set(SOURCES)
+    if unknown:
+        raise ValueError(
+            f"MIMIR_DIARIZE_SOURCES refers to unknown labels {sorted(unknown)}; "
+            f"every entry must match a MIMIR_SOURCES label"
+        )
+
 MODEL_NAME = os.environ.get("MIMIR_MODEL", "distil-large-v3")
 LANGUAGE = os.environ.get("MIMIR_LANGUAGE", "en")
 COMPUTE_TYPE = os.environ.get("MIMIR_COMPUTE_TYPE", "int8")
@@ -109,8 +163,17 @@ TCP_PORT = int(os.environ.get("MIMIR_TCP_PORT", "7200"))
 VAD_METHOD = os.environ.get("MIMIR_VAD_METHOD", "silero")
 
 SAMPLE_RATE = 16000  # heimdall produces 16 kHz mono s16le
-WINDOW_BYTES = SAMPLE_RATE * WINDOW_SECONDS * 2  # 2 bytes per sample
-MAX_BUFFER_BYTES = SAMPLE_RATE * 60 * 2  # cap each source at 60 s of audio
+BYTES_PER_SEC = SAMPLE_RATE * 2  # 2 bytes per sample
+WINDOW_BYTES = BYTES_PER_SEC * WINDOW_SECONDS
+MAX_BUFFER_BYTES = BYTES_PER_SEC * 60  # cap each source at 60 s of audio
+
+# How much diart event history to keep in memory per source, in whole
+# events, before trimming. Diart emits tracks on every chunk (~0.5s)
+# and the per-chunk annotation contains multiple running tracks, so
+# the event stream is noisy. 20000 entries ≈ a few minutes of audio;
+# trim to 10000 when we hit the ceiling.
+DIART_EVENTS_CEILING = 20000
+DIART_EVENTS_FLOOR = 10000
 
 
 # ─── logging ─────────────────────────────────────────────────────────────────
@@ -132,6 +195,33 @@ shutdown_event = threading.Event()
 audio_buffers: dict[str, bytearray] = {label: bytearray() for label in SOURCES}
 audio_buffer_lock = threading.Lock()
 audio_buffer_cond = threading.Condition(audio_buffer_lock)
+
+# Wall-clock time (unix epoch seconds) of the byte currently at the
+# head of each audio_buffer. None when the buffer is empty / no bytes
+# have ever been received. Updated by reader_thread on first fill and
+# on trim; by worker_thread on window extract. Used to map transcript
+# segments to wall-clock times for correlation with diart events.
+head_wall_times: dict[str, float | None] = {label: None for label in SOURCES}
+
+# Per-source rolling list of (audio_start, audio_end, speaker) tuples
+# received from the mimir-diart sidecar. audio_start/audio_end are in
+# seconds relative to that source's audio_start_wall anchor (stored
+# separately below). Appended by diart_reader_thread; read by
+# worker_thread under diart_events_lock.
+diart_events: dict[str, list[tuple[float, float, str]]] = {
+    label: [] for label in DIARIZE_SOURCES
+}
+
+# Per-source audio anchor — the unix-epoch wall-clock time when the
+# sidecar received its first audio byte. None until the sidecar emits
+# its "start" event. Needed to convert diart's audio-relative times to
+# wall clock for correlation with mimir's own (also wall-clock-tracked)
+# audio buffers.
+diart_audio_start_wall: dict[str, float | None] = {
+    label: None for label in DIARIZE_SOURCES
+}
+
+diart_events_lock = threading.Lock()
 
 tcp_subscribers: list[socket.socket] = []
 tcp_subscribers_lock = threading.Lock()
@@ -172,12 +262,29 @@ def reader_thread(label: str, socket_path: str) -> None:
                 if not chunk:
                     log.warning("%s: heimdall closed the connection", prefix)
                     break
+                recv_wall = time.time()
                 with audio_buffer_cond:
                     buf = audio_buffers[label]
+                    # If the buffer was empty (or has never seen bytes),
+                    # anchor head_wall_time at the wall time this chunk
+                    # arrived — less the time it represents. The chunk
+                    # is `len(chunk)` bytes of PCM, which at 32 kB/s is
+                    # `len(chunk) / BYTES_PER_SEC` seconds of audio. So
+                    # the oldest byte in the chunk represents audio
+                    # captured at roughly `recv_wall - (len(chunk) /
+                    # BYTES_PER_SEC)`. For our correlation purposes
+                    # sub-second precision is plenty.
+                    if not buf:
+                        head_wall_times[label] = recv_wall - (len(chunk) / BYTES_PER_SEC)
                     buf.extend(chunk)
                     if len(buf) > MAX_BUFFER_BYTES:
                         drop = len(buf) - MAX_BUFFER_BYTES
                         del buf[:drop]
+                        # Advance head_wall_time by the audio duration
+                        # of the dropped bytes, so it still points at
+                        # the (new) head byte's wall-clock capture time.
+                        if head_wall_times[label] is not None:
+                            head_wall_times[label] += drop / BYTES_PER_SEC
                         log.warning("%s: trimmed %d stale bytes (worker too slow?)",
                                     prefix, drop)
                     audio_buffer_cond.notify_all()
@@ -195,6 +302,155 @@ def reader_thread(label: str, socket_path: str) -> None:
             backoff = min(backoff * 2, 5.0)
 
     log.info("%s: reader exiting", prefix)
+
+
+# ─── diart event subscriber (sidecar → in-memory event list) ─────────────────
+
+def diart_reader_thread(label: str, socket_path: str) -> None:
+    """Subscribe to a mimir-diart sidecar and stream its events into memory.
+
+    Handles two event types:
+
+      {"event": "start", "audio_start_wall": <unix>}
+          Announces the wall-clock time of the first audio sample the
+          sidecar received. Stored in diart_audio_start_wall[label];
+          used by _find_speaker_for_segment to map audio-relative
+          track times to absolute wall clock for correlation.
+
+      {"event": "track", "audio_start": <s>, "audio_end": <s>,
+       "speaker": "speaker0"}
+          A speaker turn. Appended verbatim to diart_events[label].
+          The sidecar may emit the same track multiple times as
+          diart's running prediction refines; we don't dedupe because
+          the lookup path (iterate + find max overlap) is robust to
+          duplicates and fast enough.
+
+    The list is trimmed in-place when it crosses DIART_EVENTS_CEILING,
+    dropping the oldest half. Reconnects on socket loss with
+    exponential backoff.
+    """
+    backoff = 0.5
+    prefix = f"diart[{label}]"
+    events = diart_events[label]
+
+    while not shutdown_event.is_set():
+        try:
+            log.info("%s: connecting to %s", prefix, socket_path)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(socket_path)
+        except (FileNotFoundError, ConnectionRefusedError) as e:
+            log.warning("%s: sidecar not ready (%s); retrying in %.1fs",
+                        prefix, e, backoff)
+            shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, 5.0)
+            continue
+
+        log.info("%s: connected", prefix)
+        backoff = 0.5
+        buf = b""
+        try:
+            while not shutdown_event.is_set():
+                chunk = sock.recv(4096)
+                if not chunk:
+                    log.warning("%s: sidecar closed the connection", prefix)
+                    break
+                buf += chunk
+                # Process any complete JSON lines in the buffer.
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line.decode("utf-8"))
+                    except Exception:
+                        log.warning("%s: bad JSON line: %r", prefix, line[:120])
+                        continue
+
+                    ev_type = event.get("event")
+                    if ev_type == "start":
+                        try:
+                            start_wall = float(event["audio_start_wall"])
+                        except (KeyError, TypeError, ValueError):
+                            log.warning("%s: bad start event: %r", prefix, event)
+                            continue
+                        diart_audio_start_wall[label] = start_wall
+                        log.info("%s: anchored audio_start_wall=%f",
+                                 prefix, start_wall)
+
+                    elif ev_type == "track":
+                        try:
+                            audio_start = float(event["audio_start"])
+                            audio_end = float(event["audio_end"])
+                            speaker = str(event["speaker"])
+                        except (KeyError, TypeError, ValueError):
+                            log.warning("%s: bad track event: %r", prefix, event)
+                            continue
+                        with diart_events_lock:
+                            events.append((audio_start, audio_end, speaker))
+                            if len(events) > DIART_EVENTS_CEILING:
+                                # Drop the oldest half, keeping the tail
+                                # (which is the most recent speaker info
+                                # we care about for emit-time correlation).
+                                del events[: len(events) - DIART_EVENTS_FLOOR]
+                                log.info(
+                                    "%s: trimmed event list to %d entries",
+                                    prefix, len(events),
+                                )
+
+                    # Silently ignore unknown event types — forward compat.
+        except OSError as e:
+            log.error("%s: read error: %s", prefix, e)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        if not shutdown_event.is_set():
+            log.info("%s: reconnecting in %.1fs", prefix, backoff)
+            shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, 5.0)
+
+    log.info("%s: reader exiting", prefix)
+
+
+def _find_speaker_for_segment(
+    label: str,
+    seg_wall_start: float,
+    seg_wall_end: float,
+) -> str | None:
+    """Find the diart speaker with maximum overlap for a [seg_wall_start, seg_wall_end] range.
+
+    Returns the speaker label (e.g. "speaker0") or None if no diart
+    events overlap the segment — the caller falls back to plain [LABEL]
+    attribution in that case. Iterates all events for the source; the
+    list is bounded by DIART_EVENTS_CEILING so this is O(ceiling) per
+    call, which is negligible compared to whisperx inference.
+    """
+    anchor = diart_audio_start_wall.get(label)
+    if anchor is None:
+        return None  # sidecar hasn't emitted its start event yet
+    events = diart_events.get(label)
+    if not events:
+        return None
+
+    best_ov = 0.0
+    best_spk: str | None = None
+    with diart_events_lock:
+        # Snapshot under the lock so the list isn't mutated mid-iter.
+        # Small copy for a bounded list — cheap.
+        snapshot = list(events)
+
+    for audio_start, audio_end, speaker in snapshot:
+        ev_wall_start = anchor + audio_start
+        ev_wall_end = anchor + audio_end
+        overlap = max(
+            0.0, min(seg_wall_end, ev_wall_end) - max(seg_wall_start, ev_wall_start)
+        )
+        if overlap > best_ov:
+            best_ov = overlap
+            best_spk = speaker
+    return best_spk
 
 
 # ─── worker (per-source buffers → WhisperX → emit) ───────────────────────────
@@ -239,11 +495,23 @@ def worker_thread(model) -> None:
             # Extract the window from the ready source's buffer.
             window_bytes = bytes(audio_buffers[ready][:WINDOW_BYTES])
             del audio_buffers[ready][:WINDOW_BYTES]
+            # Snapshot the wall-clock time of the window's FIRST byte
+            # (which is head_wall_times[ready] BEFORE we advance it for
+            # this extraction). Used later to correlate transcript
+            # segments with diart speaker events.
+            window_start_wall = head_wall_times[ready]
+            if head_wall_times[ready] is not None:
+                head_wall_times[ready] += WINDOW_BYTES / BYTES_PER_SEC
             # Advance rotation so the other sources get first crack next
             # iteration. (label_index[ready] + 1) wraps naturally via %.
             rotation_start = (label_index[ready] + 1) % len(labels)
 
         label = ready  # for clarity in logs + output below
+        # Fallback if head_wall_time was somehow None (shouldn't happen
+        # once reader has received any bytes, but be defensive): pretend
+        # the window starts "now" so correlation is at least roughly OK.
+        if window_start_wall is None:
+            window_start_wall = time.time() - WINDOW_SECONDS
 
         # Convert int16 → float32 in [-1, 1] (whisperx wants float32 mono).
         audio = np.frombuffer(window_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -275,15 +543,28 @@ def worker_thread(model) -> None:
                 label, WINDOW_SECONDS, dt, rtf,
             )
 
-        # Emit raw segment text prefixed with the source label. The
-        # transcript is meant to flow as continuous prose; downstream
-        # consumers (odin, nc, the host's Claude Code via loki-meeting)
-        # use the `[LABEL]` prefix as the *only* speaker attribution —
-        # there is no per-window timestamp. The journal still gets
-        # stamped by systemd-journald, so debugging timing isn't lost.
+        # Emit each segment. If this source is diarized (listed in
+        # MIMIR_DIARIZE_SOURCES) and a diart speaker event overlaps
+        # the segment, tag it with `[LABEL-SPKn]`. Otherwise fall back
+        # to plain `[LABEL]`. The wall-clock range for each segment is
+        # computed from the window's start wall plus the segment's
+        # intra-window offset (seg.start / seg.end are seconds relative
+        # to the window, which is in turn anchored at window_start_wall).
         for seg in nonempty:
             text = (seg.get("text") or "").strip()
-            line = f"[{label}] {text}"
+            speaker: str | None = None
+            if label in DIARIZE_SOURCES:
+                seg_rel_start = float(seg.get("start") or 0.0)
+                seg_rel_end = float(seg.get("end") or seg_rel_start)
+                seg_wall_start = window_start_wall + seg_rel_start
+                seg_wall_end = window_start_wall + seg_rel_end
+                speaker = _find_speaker_for_segment(
+                    label, seg_wall_start, seg_wall_end
+                )
+            if speaker:
+                line = f"[{label}-{speaker.upper()}] {text}"
+            else:
+                line = f"[{label}] {text}"
             print(line, flush=True)
             _broadcast(line + "\n")
 
@@ -356,9 +637,11 @@ def tcp_accept_thread() -> None:
             # Welcome banner — best-effort, ignore failures.
             try:
                 sources_desc = ",".join(SOURCES.keys())
+                diarize_desc = ",".join(DIARIZE_SOURCES.keys()) or "none"
                 conn.send(
                     f"# mimir transcribe stream — model={MODEL_NAME} "
-                    f"window={WINDOW_SECONDS}s sources=[{sources_desc}]\n".encode()
+                    f"window={WINDOW_SECONDS}s sources=[{sources_desc}] "
+                    f"diarize=[{diarize_desc}]\n".encode()
                 )
             except (BlockingIOError, OSError):
                 pass
@@ -392,9 +675,16 @@ def main() -> int:
     logging.getLogger("whisperx.vads.silero").setLevel(logging.ERROR)
 
     sources_desc = ", ".join(f"{label}={path}" for label, path in SOURCES.items())
+    if DIARIZE_SOURCES:
+        diarize_desc = ", ".join(
+            f"{label}={path}" for label, path in DIARIZE_SOURCES.items()
+        )
+    else:
+        diarize_desc = "(none)"
     log.info(
-        "mimir starting: model=%s lang=%s window=%ds sources=[%s] tcp=%s:%d",
-        MODEL_NAME, LANGUAGE, WINDOW_SECONDS, sources_desc, TCP_HOST, TCP_PORT,
+        "mimir starting: model=%s lang=%s window=%ds sources=[%s] diarize=[%s] tcp=%s:%d",
+        MODEL_NAME, LANGUAGE, WINDOW_SECONDS, sources_desc, diarize_desc,
+        TCP_HOST, TCP_PORT,
     )
 
     log.info(
@@ -411,13 +701,21 @@ def main() -> int:
     )
     log.info("loaded whisperx in %.1fs", time.monotonic() - t0)
 
-    # One reader thread per source, plus one worker and one TCP accept.
+    # One reader thread per source, one diart reader thread per
+    # diarized source, plus one worker and one TCP accept.
     threads: list[threading.Thread] = []
     for label, socket_path in SOURCES.items():
         threads.append(threading.Thread(
             target=reader_thread,
             args=(label, socket_path),
             name=f"audio-reader[{label}]",
+            daemon=True,
+        ))
+    for label, socket_path in DIARIZE_SOURCES.items():
+        threads.append(threading.Thread(
+            target=diart_reader_thread,
+            args=(label, socket_path),
+            name=f"diart-reader[{label}]",
             daemon=True,
         ))
     threads.append(threading.Thread(

@@ -1,0 +1,50 @@
+[Unit]
+Description=mimir diart speaker diarization sidecar
+Documentation=https://github.com/3loc/mimir
+After=network-online.target heimdall@meeting.service
+Wants=network-online.target
+
+# PartOf (not Requires) so when heimdall@meeting is restarted, we
+# restart too — matches mimir's own relationship to heimdall. diart
+# keeps its own internal state (speaker embeddings) so a clean restart
+# is the correct behavior on heimdall redeploy.
+PartOf=heimdall@meeting.service
+
+[Service]
+Type=simple
+User=ted
+Group=ted
+
+# /run/mimir is where we put the diart output socket. Shared with
+# mimir.service (which also declares it) — systemd merges the
+# declarations from multiple units. RuntimeDirectoryPreserve keeps the
+# dir alive when either service restarts so the other's socket isn't
+# disturbed.
+RuntimeDirectory=mimir
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+WorkingDirectory=/home/ted/src/github.com/3loc/loki/repos/mimir
+EnvironmentFile=-/etc/mimir/mimir-diart.env
+
+# The sidecar runs in its OWN venv at .venv-diart/, separate from
+# mimir's main .venv/. diart's dep stack (torch 2.2.2, torchaudio
+# 2.2.2, pyannote.audio 3.1.1, huggingface_hub 0.20.3) is incompatible
+# with whisperx's requirements; see ADR 0008.
+ExecStart=/home/ted/src/github.com/3loc/loki/repos/mimir/.venv-diart/bin/python src/mimir_diart.py
+
+Restart=on-failure
+RestartSec=5
+
+# Pipeline load + first-chunk processing is slow on CPU; allow 5 min.
+TimeoutStartSec=300
+TimeoutStopSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+# Mild sandboxing
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,8 +1,8 @@
 [Unit]
 Description=mimir transcribe daemon
 Documentation=https://github.com/3loc/mimir
-After=network-online.target heimdall@meeting.service
-Wants=network-online.target
+After=network-online.target heimdall@meeting.service mimir-diart.service
+Wants=network-online.target mimir-diart.service
 
 # PartOf (not Requires) so when heimdall@meeting is restarted — e.g. via
 # `make deploy` from the heimdall repo — mimir is automatically restarted
@@ -10,7 +10,8 @@ Wants=network-online.target
 # propagates stop, which would leave mimir in a "failed" state any time
 # heimdall was redeployed. Mimir's reader thread already retries the
 # Unix-socket connection with backoff, so a strict hard dependency on
-# heimdall isn't needed.
+# heimdall isn't needed. Same reasoning applies to mimir-diart: mimir
+# keeps transcribing without speaker labels if diart is down.
 PartOf=heimdall@meeting.service
 
 [Service]
@@ -18,13 +19,15 @@ Type=simple
 User=ted
 Group=ted
 
+# /run/mimir is where the diart sidecar puts its event socket. We
+# declare it here too so mimir gets read access and the dir stays
+# alive across diart restarts.
+RuntimeDirectory=mimir
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
 WorkingDirectory=/home/ted/src/github.com/3loc/loki/repos/mimir
 EnvironmentFile=/etc/mimir/mimir.env
-# Optional second env file for the HuggingFace token used by pyannote
-# diarization. The leading `-` makes it optional, so the unit doesn't
-# fail if you haven't created it yet. See
-# https://github.com/3loc/mimir for the setup walkthrough.
-EnvironmentFile=-/etc/mimir/hf-token.env
 
 # uv-managed venv lives at .venv/ inside the project. We invoke the venv's
 # Python directly rather than going through `uv run` to avoid uv re-checking
